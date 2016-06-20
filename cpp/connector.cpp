@@ -28,10 +28,10 @@ int Connector::qt_metacall(QMetaObject::Call c, int idx, void **a)
                 }
                 plain = new PlainObject(typeName, addr, plain);
                 QVariant var = QVariant::fromValue((QObject *)plain);
-                packDataValue(&var, &args[i]);
+                args[i] = packDataValue2(var);
             } else {
                 QVariant var(method.parameterType(i), a[1 + i]);
-                packDataValue(&var, &args[i]);
+                args[i] = packDataValue2(var);
             }
         }
         hookSignalCall(engine, func, args);

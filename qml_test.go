@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VukoDrakkeinen/qml"
+	"github.com/VukoDrakkeinen/qml/cpptest"
+	"github.com/VukoDrakkeinen/qml/gl/2.0"
 	. "gopkg.in/check.v1"
-	"gopkg.in/qml.v1"
-	"gopkg.in/qml.v1/cpptest"
-	"gopkg.in/qml.v1/gl/2.0"
 	"path/filepath"
 )
 
@@ -191,21 +191,21 @@ func (s *S) TestEngineDestroyedUse(c *C) {
 }
 
 var same = "<same>"
-
 var getSetTests = []struct{ set, get interface{} }{
 	{"value", same},
 	{true, same},
 	{false, same},
-	{int(42), same},
-	{int32(42), int(42)},
-	{int64(42), same},
+	{int(42), jsNumberI42},
+	{int32(42), same},
+	{int64(42), float64(42)},
+	{uint(42), jsNumberU42},
 	{uint32(42), same},
-	{uint64(42), same},
+	{uint64(42), float64(42)},
 	{float64(42), same},
-	{float32(42), same},
+	{float32(42), float64(42)},
 	{new(GoType), same},
 	{nil, same},
-	{42, same},
+	{42, jsNumberI42},
 }
 
 func (s *S) TestContextGetSet(c *C) {
@@ -216,7 +216,7 @@ func (s *S) TestContextGetSet(c *C) {
 		}
 		s.context.SetVar("key", t.set)
 		c.Assert(s.context.Var("key"), Equals, want,
-			Commentf("entry %d is {%v (%T), %v (%T)}", i, t.set, t.set, t.get, t.get))
+			Commentf("entry %d is {%v (%[2]T), %v (%[3]T)}", i, t.set, t.get))
 	}
 }
 
@@ -244,15 +244,15 @@ func (s *S) TestContextSetVars(c *C) {
 
 	c.Assert(s.context.Var("stringValue"), Equals, "<content>")
 	c.Assert(s.context.Var("boolValue"), Equals, true)
-	c.Assert(s.context.Var("intValue"), Equals, 42)
-	c.Assert(s.context.Var("int64Value"), Equals, int64(42))
-	c.Assert(s.context.Var("int32Value"), Equals, 42)
+	c.Assert(s.context.Var("intValue"), Equals, jsNumberI42)
+	c.Assert(s.context.Var("int64Value"), Equals, float64(42))
+	c.Assert(s.context.Var("int32Value"), Equals, int32(42))
 	c.Assert(s.context.Var("float64Value"), Equals, float64(4.2))
-	c.Assert(s.context.Var("float32Value"), Equals, float32(4.2))
+	c.Assert(s.context.Var("float32Value"), Equals, float64(float32(4.2)))
 	c.Assert(s.context.Var("anyValue"), Equals, nil)
 
 	vars.AnyValue = 42
-	c.Assert(s.context.Var("anyValue"), Equals, 42)
+	c.Assert(s.context.Var("anyValue"), Equals, jsNumberI42)
 
 	c.Assert(s.context.Var("objectValue").(qml.Object).Int("width"), Equals, 42)
 }
@@ -439,6 +439,7 @@ type TestData struct {
 	createdValue     []*GoType
 	createdRect      []*GoRect
 	createdSingleton []*GoType
+	wait             chan struct{}
 }
 
 var tests = []struct {
@@ -472,7 +473,7 @@ var tests = []struct {
 				}
 			}
 		`,
-		QMLLog: "String is <content>.*Int is 42.*Any is undefined",
+		QMLLog: "String is <content>.*Int is 42.*Any is null",
 	},
 	{
 		Summary: "Read a nested field via a value (not pointer) in an interface",
@@ -556,16 +557,16 @@ var tests = []struct {
 		},
 		DoneLog: "String is <content>.*Width is 300.*Height is 200",
 	},
-	{
-		Summary: "Read and set a QUrl property",
-		QML:     `import QtWebKit 3.0; WebView {}`,
-		Done: func(c *TestData) {
-			c.Check(c.root.String("url"), Equals, "")
-			url := "http://localhost:54321"
-			c.root.Set("url", url)
-			c.Check(c.root.String("url"), Equals, url)
-		},
-	},
+	//{
+	//	Summary: "Read and set a QUrl property",	//fixme: reenable after WebKit becomes available
+	//	QML:     `import QtWebKit 3.0; WebView {}`,
+	//	Done: func(c *TestData) {
+	//		c.Check(c.root.String("url"), Equals, "")
+	//		url := "http://localhost:54321"
+	//		c.root.Set("url", url)
+	//		c.Check(c.root.String("url"), Equals, url)
+	//	},
+	//},
 	{
 		Summary: "Read and set a QColor property",
 		QML:     `Text{ color: Qt.rgba(1/16, 1/8, 1/4, 1/2); function hasColor(c) { return Qt.colorEqual(color, c) }}`,
@@ -660,9 +661,9 @@ var tests = []struct {
 		},
 	},
 	{
-		Summary:  "Call a method with a JSON object (issue #48)",
-		QML:      `Item { Component.onCompleted: value.setMapValue({a: 1, b: 2}) }`,
-		QMLValue: GoType{MapValue: map[string]interface{}{"a": 1, "b": 2}},
+		Summary:  "Call a method with a JSON object (issue #47)",
+		QML:      `Item { Component.onCompleted: value.mapValue = {a: 1, b: 2} }`,
+		QMLValue: GoType{MapValue: map[string]interface{}{"a": int32(1), "b": int32(2)}},
 	},
 	{
 		Summary: "Read a map from a QML property",
@@ -673,7 +674,7 @@ var tests = []struct {
 			m := c.root.Map("m")
 			m.Convert(&m1)
 			m.Convert(&m2)
-			c.Assert(m1, DeepEquals, map[string]interface{}{"a": 1, "b": 2})
+			c.Assert(m1, DeepEquals, map[string]interface{}{"a": int32(1), "b": int32(2)})
 			c.Assert(m2, DeepEquals, map[string]int{"a": 1, "b": 2})
 			c.Assert(m.Len(), Equals, 2)
 		},
@@ -931,7 +932,7 @@ var tests = []struct {
 				}
 			}
 		`,
-		QMLLog: `mod is 2 and err is undefined`,
+		QMLLog: `mod is 2 and err is null`,
 	},
 	{
 		Summary: "Call a Go method that returns an error",
@@ -1010,7 +1011,8 @@ var tests = []struct {
 		QML: `
 			Item {
 				property var held
-				function hold(v) { held = v; gc(); gc(); }
+				function hold(v) { held = v; gc(); gc(); gc(); gc(); gc(); gc(); }
+				function pleaseGC() { gc(); }
 				function log()   { console.log("String is", held.stringValue) }
 			}`,
 		Done: func(c *TestData) {
@@ -1020,6 +1022,7 @@ var tests = []struct {
 			c.Check(qml.Stats().ValuesAlive, Equals, stats.ValuesAlive+1)
 			c.root.Call("log")
 			c.root.Call("hold", nil)
+			c.root.Call("pleaseGC")
 			c.Check(qml.Stats().ValuesAlive, Equals, stats.ValuesAlive)
 		},
 		DoneLog: "String is <content>",
@@ -1148,20 +1151,20 @@ var tests = []struct {
 			c.Check(stack, DeepEquals, []interface{}{"A", "B", "<arg>", "C", "<arg>", 123})
 		},
 	},
-	{
-		Summary: "Connect to a QML signal with an object parameter",
-		QML:     `import QtWebKit 3.0; WebView{}`,
-		Done: func(c *TestData) {
-			url := "http://localhost:54321/"
-			done := make(chan bool)
-			c.root.On("navigationRequested", func(request qml.Object) {
-				c.Check(request.String("url"), Equals, url)
-				done <- true
-			})
-			c.root.Set("url", url)
-			<-done
-		},
-	},
+	//{
+	//	Summary: "Connect to a QML signal with an object parameter",	//fixme: reenable after WebKit becomes available
+	//	QML:     `import QtWebKit 3.0; WebView{}`,
+	//	Done: func(c *TestData) {
+	//		url := "http://localhost:54321/"
+	//		done := make(chan bool)
+	//		c.root.On("navigationRequested", func(request qml.Object) {
+	//			c.Check(request.String("url"), Equals, url)
+	//			done <- true
+	//		})
+	//		c.root.Set("url", url)
+	//		<-done
+	//	},
+	//},
 	{
 		Summary: "Load image from Go provider",
 		Init: func(c *TestData) {
@@ -1200,8 +1203,16 @@ var tests = []struct {
 			defer window.Destroy()
 			window.Show()
 
-			// Qt doesn't hide the Window if we call it too quickly. :-(
-			time.Sleep(100 * time.Millisecond)
+			select {
+			case <-c.wait: //...for GoRect's Init to fire
+			case <-time.After(5 * time.Second):
+				buf := make([]byte, 1<<16)
+				runtime.Stack(buf, true)
+				fmt.Printf("%s\n", buf)
+				c.Fatalf("%s\n", buf)
+				c.Fatal("Timed out while waiting for GoRect's Init")
+			}
+			time.Sleep(32 * time.Millisecond) //and now for GoRect to be drawn
 
 			c.Assert(c.createdRect, HasLen, 1)
 			c.Assert(c.createdRect[0].PaintCount, Equals, 1)
@@ -1226,8 +1237,8 @@ var tests = []struct {
 
 			c.Assert(func() { rect.Set("parent", root) }, Panics,
 				`cannot set property "parent" with type QQuickItem* to value of QQuickWindow*`)
-			c.Assert(func() { rect.Set("parent", 42) }, Panics,
-				`cannot set property "parent" with type QQuickItem* to value of int`)
+			c.Assert(func() { rect.Set("parent", int64(42)) }, Panics,
+				`cannot set property "parent" with type QQuickItem* to value of double`)
 			c.Assert(func() { rect.Set("non_existent", 0) }, Panics,
 				`cannot set non-existent property "non_existent" on type QQuickRectangle`)
 		},
@@ -1323,6 +1334,11 @@ func (s *S) TestTable(c *C) {
 	}, {
 		Init: func(v *GoRect, obj qml.Object) {
 			testData.createdRect = append(testData.createdRect, v)
+			select {
+			case <-testData.wait:
+			default:
+				close(testData.wait)
+			}
 		},
 	}}
 
@@ -1360,6 +1376,7 @@ func (s *S) TestTable(c *C) {
 			}
 		}
 
+		testData.wait = make(chan struct{})
 		component, err := s.engine.LoadString("file.qml", "import QtQuick 2.0\nimport GoTypes 4.2\n"+strings.TrimSpace(t.QML))
 		c.Assert(err, IsNil)
 
@@ -1433,4 +1450,116 @@ func (s *S) TestTable(c *C) {
 			c.FailNow() // So relevant logs are at the bottom.
 		}
 	}
+}
+
+type CustomString string
+type CustomInt int32
+type TypeThatHasOwnValueOf bool
+type Rammstein struct {
+	Gelassen int
+	Zwei     string
+}
+
+func (this *CustomString) Hex() {
+	*this = CustomString("A sheep!")
+}
+
+func (this TypeThatHasOwnValueOf) ValueOf() bool {
+	return true
+}
+
+func (this TypeThatHasOwnValueOf) ToString() string {
+	return "Bang! Bang! Feuer frei!"
+}
+
+func (s *S) TestValueOf(c *C) { //TODO: test all the pack/unpack conversions
+	c.Skip("Broken test (WIP)")
+	cs := CustomString("Our custom string.")
+	s.context.SetVar("customStr", &cs)
+	s.context.SetVar("customInt", CustomInt(8))
+	s.context.SetVar("customBol", TypeThatHasOwnValueOf(false))
+	s.context.SetVar("noTouchy", Rammstein{77, "Herzeleid"})
+	s.context.SetVar("goInt", 22)
+	logMark := c.GetTestLog()
+	component, err := s.engine.LoadString("file.qml", `
+		import QtQuick 2.0
+		Item {
+			property int intAssign: 0
+			property string strAssign: ""
+			property bool boolAssign: false
+			Component.onCompleted: {
+				function myNumberType(n) {
+				    this.number = n;
+				}
+
+				myNumberType.prototype.valueOf = function() {
+				    return 7;
+				};
+
+				var myObj = new myNumberType(4);
+				//console.log(myObj + 3)
+				properties(Qt.point(3, 20))
+				properties(customStr)
+				properties(customInt)
+				properties(customBol)
+				console.log(goInt)
+				console.log("Add:", goInt + 8)
+				console.log("Append:", "22" + 8)
+				console.log(goInt.toString())
+				console.log(goInt + "Alte leid")
+				console.log(typeof goInt)
+				console.log(typeof +goInt)
+				console.log(typeof customStr)
+				console.log(typeof customInt)
+				console.log()
+				console.log("Bare str:", customStr)
+				console.log("Bare int:", customInt)
+				console.log("Bare bol:", customBol)
+				console.log("Add  int:", customInt + 8)
+				console.log("AddV int:", customInt.valueOf() + 8)
+				console.log("Str bool:", customBol.toString())
+				console.log("Val bool:", customBol.valueOf())
+				console.log("Str  str:", customStr.toString())
+				console.log("Val  str:", customStr.valueOf())
+				console.log("Appd str:", customStr + "Zwitter")
+				console.log("Add  NoT:", noTouchy + 8)
+				console.log("Appd NoT:", noTouchy + "Zwitter")
+				console.log("Val  NoT:", noTouchy.valueOf())
+			}
+			function hexThisString() {
+				customStr.hex()
+				console.log("Hexed string is:", customStr.valueOf())
+			}
+			function assignProps() {
+				intAssign = goInt
+				intAssign = customInt
+				boolAssign = customBol
+				//strAssign = customStr
+				console.log("ia:", intAssign)
+				console.log("ba:", boolAssign)
+				console.log("sa:", strAssign)
+			}
+			function properties(obj) {
+				var result = [];
+				for (var id in obj) {
+					try {
+						//if (typeof(obj[id]) == "function") {
+						result.push(id + ": " + obj[id].toString());
+						//}
+					} catch (err) {
+						result.push(id + ": inaccessible (" + err.toString() + ")");
+					}
+				}
+				console.log(obj, ":#", result, "#");
+			}
+		}
+	`)
+	root := component.Create(nil)
+	defer root.Destroy()
+	root.Call("hexThisString")
+	root.Call("assignProps")
+	logged := c.GetTestLog()[len(logMark):]
+	c.Assert(err, IsNil)
+	c.Assert(string(cs), Equals, "A sheep!")
+	c.Assert(logged, Matches, "(?s).*Bare str: Our custom string..*Bare int: 8.*Bare bol: true.*Add int: 16.*Hexed string is: A sheep!.*")
 }

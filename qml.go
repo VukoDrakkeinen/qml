@@ -9,7 +9,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"gopkg.in/qml.v1/gl/glbase"
+	"github.com/VukoDrakkeinen/qml/gl/glbase"
 	"image"
 	"image/color"
 	"io"
@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -39,7 +40,7 @@ var engines = make(map[unsafe.Pointer]*Engine)
 // release any resources used.
 func NewEngine() *Engine {
 	engine := &Engine{values: make(map[interface{}]*valueFold)}
-	RunMain(func() {
+	RunInMain(func() {
 		engine.addr = C.newEngine(nil)
 		engine.engine = engine
 		engine.imageProviders = make(map[string]*func(imageId string, width, height int) image.Image)
@@ -61,7 +62,7 @@ func (e *Engine) assertValid() {
 // It is safe to call Destroy more than once.
 func (e *Engine) Destroy() {
 	if !e.destroyed {
-		RunMain(func() {
+		RunInMain(func() {
 			if !e.destroyed {
 				e.destroyed = true
 				C.delObjectLater(e.addr)
@@ -110,7 +111,7 @@ func (e *Engine) Load(location string, r io.Reader) (Object, error) {
 			}
 		}
 
-		// Workaround issue #84 (QTBUG-41193) by not refering to an existent file.
+		// Workaround issue #84 (QTBUG-41193) by not referring to an existent file.
 		if s := strings.TrimPrefix(location, "file:///"); s != location {
 			if _, err := os.Stat(filepath.FromSlash(s)); err == nil {
 				location = location + "."
@@ -123,7 +124,7 @@ func (e *Engine) Load(location string, r io.Reader) (Object, error) {
 	var err error
 	cloc, cloclen := unsafeStringData(location)
 	comp := &Common{engine: e}
-	RunMain(func() {
+	RunInMain(func() {
 		// TODO The component's parent should probably be the engine.
 		comp.addr = C.newComponent(e.addr, nilPtr)
 		if qrc {
@@ -176,7 +177,7 @@ func (e *Engine) Context() *Context {
 	e.assertValid()
 	var ctx Context
 	ctx.engine = e
-	RunMain(func() {
+	RunInMain(func() {
 		ctx.addr = C.engineRootContext(e.addr)
 	})
 	return &ctx
@@ -234,7 +235,7 @@ func (e *Engine) AddImageProvider(prvId string, f func(imgId string, width, heig
 	}
 	e.imageProviders[prvId] = &f
 	cprvId, cprvIdLen := unsafeStringData(prvId)
-	RunMain(func() {
+	RunInMain(func() {
 		qprvId := C.newString(cprvId, cprvIdLen)
 		defer C.delString(qprvId)
 		C.engineAddImageProvider(e.addr, qprvId, unsafe.Pointer(&f))
@@ -295,9 +296,8 @@ type Context struct {
 // value is unused or changed.
 func (ctx *Context) SetVar(name string, value interface{}) {
 	cname, cnamelen := unsafeStringData(name)
-	RunMain(func() {
-		var dvalue C.DataValue
-		packDataValue(value, &dvalue, ctx.engine, cppOwner)
+	RunInMain(func() {
+		dvalue := packDataValue(value, ctx.engine, cppOwner)
 
 		qname := C.newString(cname, cnamelen)
 		defer C.delString(qname)
@@ -316,7 +316,7 @@ func (ctx *Context) SetVar(name string, value interface{}) {
 // not be garbage collected until the engine is destroyed, even if the
 // value is unused or changed.
 func (ctx *Context) SetVars(value interface{}) {
-	RunMain(func() {
+	RunInMain(func() {
 		C.contextSetObject(ctx.addr, wrapGoValue(ctx.engine, value, cppOwner))
 	})
 }
@@ -326,20 +326,20 @@ func (ctx *Context) Var(name string) interface{} {
 	cname, cnamelen := unsafeStringData(name)
 
 	var dvalue C.DataValue
-	RunMain(func() {
+	RunInMain(func() {
 		qname := C.newString(cname, cnamelen)
 		defer C.delString(qname)
 
 		C.contextGetProperty(ctx.addr, qname, &dvalue)
 	})
-	return unpackDataValue(&dvalue, ctx.engine)
+	return unpackDataValue(dvalue, ctx.engine)
 }
 
 // Spawn creates a new context that has ctx as a parent.
 func (ctx *Context) Spawn() *Context {
 	var result Context
 	result.engine = ctx.engine
-	RunMain(func() {
+	RunInMain(func() {
 		result.addr = C.contextSpawn(ctx.addr)
 	})
 	return &result
@@ -361,6 +361,7 @@ type Object interface {
 	Bool(property string) bool
 	String(property string) string
 	Color(property string) color.RGBA
+	Time(property string) time.Time
 	Object(property string) Object
 	Map(property string) *Map
 	List(property string) *List
@@ -418,18 +419,48 @@ func (m *Map) Len() int {
 	return len(m.data) / 2
 }
 
+//todo: correct the docs here (can now also accept struct pointers)
 // Convert allocates a new map and copies the content of m property to it,
 // performing type conversions as possible, and then assigns the result to
 // the map pointed to by mapAddr. Map panics if m contains values that
 // cannot be converted to the type of the map at mapAddr.
-func (m *Map) Convert(mapAddr interface{}) {
-	toPtr := reflect.ValueOf(mapAddr)
-	if toPtr.Kind() != reflect.Ptr || toPtr.Type().Elem().Kind() != reflect.Map {
-		panic(fmt.Sprintf("Map.Convert got a mapAddr parameter that is not a map address: %#v", mapAddr))
+func (m *Map) Convert(mapOrStructAddr interface{}) {
+	toPtr := reflect.ValueOf(mapOrStructAddr)
+	if toPtr.Kind() != reflect.Ptr && toPtr.Type().Elem().Kind() != reflect.Map && toPtr.Type().Elem().Kind() != reflect.Struct {
+		panic(fmt.Sprintf("Map.Convert got a parameter that is not a map or struct address: %#v", mapOrStructAddr))
 	}
 	err := convertAndSet(toPtr.Elem(), reflect.ValueOf(m), reflect.Value{})
 	if err != nil {
 		panic(err.Error())
+	}
+}
+
+//todo: docs
+//explicit unmarshalling
+func (m *Map) Unmarshal(structAddr interface{}) {
+	val := reflect.ValueOf(structAddr)
+	if val.Kind() != reflect.Ptr || val.Type().Elem().Kind() != reflect.Struct {
+		panic(fmt.Sprintf("Map.Unmarshal got a structAddr parameter that is not a struct address: %T", structAddr))
+	}
+	m.unmarshal(val)
+}
+
+func (m *Map) unmarshal(toPtr reflect.Value) {
+	if toPtr.IsNil() { //todo: move higher up?
+		toPtr.Set(reflect.New(toPtr.Type().Elem()))
+	}
+	to := toPtr.Elem()
+	for i := 0; i < len(m.data); i += 2 {
+		fieldName := reflect.ValueOf(m.data[i]).String()
+		val := reflect.ValueOf(m.data[i+1])
+		field := to.FieldByNameFunc(func(s string) bool { return string(appendLoweredName(make([]byte, 0, len(s)), s)) == fieldName })
+		if !field.IsValid() {
+			panic(fmt.Sprintf("Map.Unmarshal cannot find field %v in given struct", fieldName))
+		}
+		err := convertAndSet(field, val, reflect.Value{})
+		if err != nil {
+			panic(err.Error())
+		}
 	}
 }
 
@@ -461,7 +492,7 @@ func (obj *Common) Common() *Common {
 // TypeName returns the underlying type name for the held value.
 func (obj *Common) TypeName() string {
 	var name string
-	RunMain(func() {
+	RunInMain(func() {
 		name = C.GoString(C.objectTypeName(obj.addr))
 	})
 	return name
@@ -483,7 +514,7 @@ func (obj *Common) Addr() uintptr {
 func (obj *Common) Interface() interface{} {
 	var result interface{}
 	var cerr *C.error
-	RunMain(func() {
+	RunInMain(func() {
 		var fold *valueFold
 		if cerr = C.objectGoAddr(obj.addr, (*unsafe.Pointer)(unsafe.Pointer(&fold))); cerr == nil {
 			result = fold.gvalue
@@ -498,9 +529,8 @@ func (obj *Common) Set(property string, value interface{}) {
 	cproperty := C.CString(property)
 	defer C.free(unsafe.Pointer(cproperty))
 	var cerr *C.error
-	RunMain(func() {
-		var dvalue C.DataValue
-		packDataValue(value, &dvalue, obj.engine, cppOwner)
+	RunInMain(func() {
+		dvalue := packDataValue(value, obj.engine, cppOwner)
 		cerr = C.objectSetProperty(obj.addr, cproperty, &dvalue)
 	})
 	cmust(cerr)
@@ -516,13 +546,13 @@ func (obj *Common) Property(name string) interface{} {
 
 	var dvalue C.DataValue
 	var found C.int
-	RunMain(func() {
+	RunInMain(func() {
 		found = C.objectGetProperty(obj.addr, cname, &dvalue)
 	})
 	if found == 0 {
 		panic(fmt.Sprintf("object does not have a %q property", name))
 	}
-	return unpackDataValue(&dvalue, obj.engine)
+	return unpackDataValue(dvalue, obj.engine)
 }
 
 // Int returns the int value of the named property.
@@ -530,6 +560,8 @@ func (obj *Common) Property(name string) interface{} {
 func (obj *Common) Int(property string) int {
 	switch value := obj.Property(property).(type) {
 	case int64:
+		return int(value)
+	case int32:
 		return int(value)
 	case int:
 		return value
@@ -554,6 +586,8 @@ func (obj *Common) Int64(property string) int64 {
 	switch value := obj.Property(property).(type) {
 	case int64:
 		return value
+	case int32:
+		return int64(value)
 	case int:
 		return int64(value)
 	case uint64:
@@ -576,6 +610,8 @@ func (obj *Common) Int64(property string) int64 {
 func (obj *Common) Float64(property string) float64 {
 	switch value := obj.Property(property).(type) {
 	case int64:
+		return float64(value)
+	case int32:
 		return float64(value)
 	case int:
 		return float64(value)
@@ -625,6 +661,17 @@ func (obj *Common) Color(property string) color.RGBA {
 	return c
 }
 
+// Time returns the time value of the named property.
+// Time panics if the property is not a time.
+func (obj *Common) Time(property string) time.Time {
+	value := obj.Property(property)
+	t, ok := value.(time.Time)
+	if !ok {
+		panic(fmt.Sprintf("value of property %q is not a time: %#v", property, value))
+	}
+	return t
+}
+
 // Object returns the object value of the named property.
 // Object panics if the property is not a QML object.
 func (obj *Common) Object(property string) Object {
@@ -665,12 +712,12 @@ func (obj *Common) ObjectByName(objectName string) Object {
 	cname, cnamelen := unsafeStringData(objectName)
 	var dvalue C.DataValue
 	var object Object
-	RunMain(func() {
+	RunInMain(func() {
 		qname := C.newString(cname, cnamelen)
 		defer C.delString(qname)
 		C.objectFindChild(obj.addr, qname, &dvalue)
 		// unpackDataValue will also initialize the Go type, if necessary.
-		value := unpackDataValue(&dvalue, obj.engine)
+		value := unpackDataValue(dvalue, obj.engine)
 		if dvalue.dataType == C.DTGoAddr {
 			datap := unsafe.Pointer(&dvalue.data)
 			fold := (*(**valueFold)(datap))
@@ -697,14 +744,14 @@ func (obj *Common) Call(method string, params ...interface{}) interface{} {
 	cmethod, cmethodLen := unsafeStringData(method)
 	var result C.DataValue
 	var cerr *C.error
-	RunMain(func() {
+	RunInMain(func() {
 		for i, param := range params {
-			packDataValue(param, &dataValueArray[i], obj.engine, jsOwner)
+			dataValueArray[i] = packDataValue(param, obj.engine, jsOwner)
 		}
 		cerr = C.objectInvoke(obj.addr, cmethod, cmethodLen, &result, &dataValueArray[0], C.int(len(params)))
 	})
 	cmust(cerr)
-	return unpackDataValue(&result, obj.engine)
+	return unpackDataValue(result, obj.engine)
 }
 
 // Create creates a new instance of the component held by obj.
@@ -719,7 +766,7 @@ func (obj *Common) Create(ctx *Context) Object {
 	}
 	var root Common
 	root.engine = obj.engine
-	RunMain(func() {
+	RunInMain(func() {
 		ctxaddr := nilPtr
 		if ctx != nil {
 			ctxaddr = ctx.addr
@@ -742,7 +789,7 @@ func (obj *Common) CreateWindow(ctx *Context) *Window {
 	}
 	var win Window
 	win.engine = obj.engine
-	RunMain(func() {
+	RunInMain(func() {
 		ctxaddr := nilPtr
 		if ctx != nil {
 			ctxaddr = ctx.addr
@@ -757,7 +804,7 @@ func (obj *Common) CreateWindow(ctx *Context) *Window {
 func (obj *Common) Destroy() {
 	// TODO We might hook into the destroyed signal, and prevent this object
 	//      from being used in post-destruction crash-prone ways.
-	RunMain(func() {
+	RunInMain(func() {
 		if obj.addr != nilPtr {
 			C.delObjectLater(obj.addr)
 			obj.addr = nilPtr
@@ -773,7 +820,7 @@ var connectedFunction = make(map[*interface{}]bool)
 //
 // The provided function must accept a number of parameters that is equal to
 // or less than the number of parameters provided by the signal, and the
-// resepctive parameter types must match exactly or be conversible according
+// respective parameter types must match exactly or be convertible according
 // to normal Go rules.
 //
 // For example:
@@ -798,7 +845,7 @@ func (obj *Common) On(signal string, function interface{}) {
 	}
 	csignal, csignallen := unsafeStringData(signal)
 	var cerr *C.error
-	RunMain(func() {
+	RunInMain(func() {
 		cerr = C.objectConnect(obj.addr, csignal, csignallen, obj.engine.addr, unsafe.Pointer(&function), C.int(funcv.Type().NumIn()))
 		if cerr == nil {
 			connectedFunction[&function] = true
@@ -829,7 +876,7 @@ func hookSignalCall(enginep unsafe.Pointer, funcp unsafe.Pointer, args *C.DataVa
 	numIn := funct.NumIn()
 	var params [C.MaxParams]reflect.Value
 	for i := 0; i < numIn; i++ {
-		arg := (*C.DataValue)(unsafe.Pointer(uintptr(unsafe.Pointer(args)) + uintptr(i)*dataValueSize))
+		arg := *(*C.DataValue)(unsafe.Pointer(uintptr(unsafe.Pointer(args)) + uintptr(i)*dataValueSize))
 		param := reflect.ValueOf(unpackDataValue(arg, engine))
 		if paramt := funct.In(i); param.Type() != paramt {
 			// TODO Provide a better error message when this fails.
@@ -861,14 +908,14 @@ type Window struct {
 
 // Show exposes the window.
 func (win *Window) Show() {
-	RunMain(func() {
+	RunInMain(func() {
 		C.windowShow(win.addr)
 	})
 }
 
 // Hide hides the window.
 func (win *Window) Hide() {
-	RunMain(func() {
+	RunInMain(func() {
 		C.windowHide(win.addr)
 	})
 }
@@ -879,7 +926,7 @@ func (win *Window) Hide() {
 // uniquely represent the window inside the corresponding screen.
 func (win *Window) PlatformId() uintptr {
 	var id uintptr
-	RunMain(func() {
+	RunInMain(func() {
 		id = uintptr(C.windowPlatformId(win.addr))
 	})
 	return id
@@ -891,7 +938,7 @@ func (win *Window) PlatformId() uintptr {
 func (win *Window) Root() Object {
 	var obj Common
 	obj.engine = win.engine
-	RunMain(func() {
+	RunInMain(func() {
 		obj.addr = C.windowRootObject(win.addr)
 	})
 	return &obj
@@ -902,7 +949,7 @@ func (win *Window) Wait() {
 	// XXX Test this.
 	var m sync.Mutex
 	m.Lock()
-	RunMain(func() {
+	RunInMain(func() {
 		// TODO Must be able to wait for the same Window from multiple goroutines.
 		// TODO If the window is not visible, must return immediately.
 		waitingWindows[win.addr] = &m
@@ -928,7 +975,7 @@ func hookWindowHidden(addr unsafe.Pointer) {
 func (win *Window) Snapshot() image.Image {
 	// TODO Test this.
 	var cimage unsafe.Pointer
-	RunMain(func() {
+	RunInMain(func() {
 		cimage = C.windowGrabWindow(win.addr)
 	})
 	defer C.delImage(cimage)
@@ -1042,7 +1089,7 @@ func registerType(location string, major, minor int, spec *TypeSpec) error {
 	}
 
 	var err error
-	RunMain(func() {
+	RunInMain(func() {
 		cloc := C.CString(location)
 		cname := C.CString(localSpec.Name)
 		cres := C.int(0)
@@ -1051,7 +1098,6 @@ func registerType(location string, major, minor int, spec *TypeSpec) error {
 		} else {
 			cres = C.registerType(cloc, C.int(major), C.int(minor), cname, customType, unsafe.Pointer(&localSpec))
 		}
-		// It doesn't look like it keeps references to these, but it's undocumented and unclear.
 		C.free(unsafe.Pointer(cloc))
 		C.free(unsafe.Pointer(cname))
 		if cres == -1 {
@@ -1064,10 +1110,10 @@ func registerType(location string, major, minor int, spec *TypeSpec) error {
 	return err
 }
 
-// RegisterConverter registers the convereter function to be called when a
+// RegisterConverter registers the converter function to be called when a
 // value with the provided type name is obtained from QML logic. The function
 // must return the new value to be used in place of the original value.
-func RegisterConverter(typeName string, converter func(engine *Engine, obj Object) interface{}) {
+func RegisterConverter(typeName string, converter func(engine *Engine, obj Object) interface{}) { //todo: investigate
 	if converter == nil {
 		delete(converters, typeName)
 	} else {
@@ -1088,9 +1134,9 @@ func LoadResources(r *Resources) {
 	} else if len(r.bdata) > 0 {
 		base = *(*unsafe.Pointer)(unsafe.Pointer(&r.bdata))
 	}
-	tree := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.treeOffset)))
-	name := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.nameOffset)))
-	data := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.dataOffset)))
+	tree := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.treeOffset)))
+	name := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.nameOffset)))
+	data := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.dataOffset)))
 	C.registerResourceData(C.int(r.version), tree, name, data)
 }
 
@@ -1102,8 +1148,8 @@ func UnloadResources(r *Resources) {
 	} else if len(r.bdata) > 0 {
 		base = *(*unsafe.Pointer)(unsafe.Pointer(&r.bdata))
 	}
-	tree := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.treeOffset)))
-	name := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.nameOffset)))
-	data := (*C.char)(unsafe.Pointer(uintptr(base)+uintptr(r.dataOffset)))
+	tree := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.treeOffset)))
+	name := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.nameOffset)))
+	data := (*C.char)(unsafe.Pointer(uintptr(base) + uintptr(r.dataOffset)))
 	C.unregisterResourceData(C.int(r.version), tree, name, data)
 }

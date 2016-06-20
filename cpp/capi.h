@@ -18,6 +18,7 @@ typedef void QMetaObject_;
 typedef void QObject_;
 typedef void QVariant_;
 typedef void QVariantList_;
+typedef void QVariantMap_;
 typedef void QString_;
 typedef void QQmlEngine_;
 typedef void QQmlContext_;
@@ -36,30 +37,29 @@ error *errorf(const char *format, ...);
 void panicf(const char *format, ...);
 
 typedef enum {
-    DTUnknown = 0, // Has an unsupported type.
-    DTInvalid = 1, // Does not exist or similar.
+    DTUnknown = 0, //unsupported type
+    DTInvalid = 1, //null
 
     DTString  = 10,
     DTBool    = 11,
-    DTInt64   = 12,
-    DTInt32   = 13,
-    DTUint64  = 14,
-    DTUint32  = 15,
-    DTUintptr = 16,
-    DTFloat64 = 17,
-    DTFloat32 = 18,
-    DTColor   = 19,
+    DTNumber  = 12, //double
+    DTNumberI = 13, //int
+    DTNumberU = 14, //unsigned int
+    DTUintptr = 15, //void*
+    DTColor   = 16,
+    DTTime    = 17,
 
-    DTGoAddr       = 100,
-    DTObject       = 101,
-    DTValueMap     = 102,
-    DTValueList    = 103,
-    DTVariantList  = 104,
-    DTListProperty = 105,
+    DTList = 100,   //DataValue[]
+    DTMap  = 101,   //DataValue[] (alternating key:value)
+
+    DTGoAddr       = 200,
+    DTObject       = 201,   //wrapped Go value; has methods
+    DTListProperty = 202,   //weird QList<QObject*>/[]*qml.Object wrapper
+    DTGoHandle     = 203,
 
     // Used in type information, not in an actual data value.
-    DTAny     = 201, // Can hold any of the above types.
-    DTMethod  = 202
+    DTAny     = 300, //interface{}; can hold any of the above types.
+    DTMethod  = 301
 } DataType;
 
 typedef struct {
@@ -70,11 +70,10 @@ typedef struct {
 
 typedef struct {
     char *memberName; // points to memberNames
-    DataType memberType;
+    DataType memberType;    //todo: might be removed if deemed redundant
     int reflectIndex;
     int reflectGetIndex;
     int reflectSetIndex;
-    int metaIndex;
     int addrOffset;
     char *methodSignature;
     char *resultSignature;
@@ -94,6 +93,7 @@ typedef struct {
     char *memberNames;
 
     QMetaObject_ *metaObject;
+    void (*constructor)(void* memory);
 } GoTypeInfo;
 
 typedef struct {
@@ -172,12 +172,12 @@ void goValueActivate(GoValue_ *value, GoTypeInfo *typeInfo, int addrOffset);
 void packDataValue(QVariant_ *var, DataValue *result);
 void unpackDataValue(DataValue *value, QVariant_ *result);
 
-QVariantList_ *newVariantList(DataValue *list, int len);
-
 QQmlListProperty_ *newListProperty(GoAddr *addr, intptr_t reflectIndex, intptr_t setIndex);
 
-int registerType(char *location, int major, int minor, char *name, GoTypeInfo *typeInfo, GoTypeSpec_ *spec);
-int registerSingleton(char *location, int major, int minor, char *name, GoTypeInfo *typeInfo, GoTypeSpec_ *spec);
+//int registerType(char *location, int major, int minor, char *name, GoTypeInfo *typeInfo, GoTypeSpec_ *spec);
+//int registerSingleton(char *location, int major, int minor, char *name, GoTypeInfo *typeInfo, GoTypeSpec_ *spec);
+int registerType(const char* uri, int versionMajor, int versionMinor, const char* qmlName, GoTypeInfo* typeInfo, GoTypeSpec_* spec);
+int registerSingleton(const char* uri, int versionMajor, int versionMinor, const char* qmlName, GoTypeInfo* typeInfo, GoTypeSpec_* spec);
 
 void installLogHandler();
 

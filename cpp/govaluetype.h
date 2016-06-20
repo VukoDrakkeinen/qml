@@ -3,44 +3,20 @@
 
 #include "govalue.h"
 
-template <int N>
-class GoValueType : public GoValue
+using GoTypeInfo_ = void;
+
+class GoValueType : public GoValueWrapper
 {
 public:
+    GoValueType(GoTypeInfo* typeInfo, GoTypeSpec_* spec) : GoValueWrapper(hookGoValueTypeNew(this, spec), typeInfo, nullptr) {};
 
-    GoValueType()
-        : GoValue(hookGoValueTypeNew(this, typeSpec), typeInfo, 0) {};
-
-    static void init(GoTypeInfo *info, GoTypeSpec_ *spec)
-    {
-        typeInfo = info;
-        typeSpec = spec;
-        static_cast<QMetaObject &>(staticMetaObject) = *metaObjectFor(typeInfo);
-    };
-
-    static GoTypeSpec_ *typeSpec;
-    static GoTypeInfo *typeInfo;
-    static QMetaObject staticMetaObject;
 };
 
-template <int N>
-class GoPaintedValueType : public GoPaintedValue
+class GoPaintedValueType : public GoPaintedValueWrapper
 {
 public:
+    GoPaintedValueType(GoTypeInfo* typeInfo, GoTypeSpec_* spec) : GoPaintedValueWrapper(hookGoValueTypeNew(this, spec), typeInfo, nullptr) {};
 
-    GoPaintedValueType()
-        : GoPaintedValue(hookGoValueTypeNew(this, typeSpec), typeInfo, 0) {};
-
-    static void init(GoTypeInfo *info, GoTypeSpec_ *spec)
-    {
-        typeInfo = info;
-        typeSpec = spec;
-        static_cast<QMetaObject &>(staticMetaObject) = *metaObjectFor(typeInfo);
-    };
-
-    static GoTypeSpec_ *typeSpec;
-    static GoTypeInfo *typeInfo;
-    static QMetaObject staticMetaObject;
 };
 
 #endif // GOVALUETYPE_H

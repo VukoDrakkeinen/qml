@@ -18,7 +18,7 @@
 #endif
 
 QT_BEGIN_MOC_NAMESPACE
-struct qt_meta_stringdata_GoValue_t {
+/*struct qt_meta_stringdata_GoValue_t {
     QByteArrayData data[1];
     char stringdata[9];
 };
@@ -84,8 +84,8 @@ int GoValue::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
     if (_id < 0)
         return _id;
     return _id;
-}
-struct qt_meta_stringdata_GoPaintedValue_t {
+}*/
+/*struct qt_meta_stringdata_GoPaintedValue_t {
     QByteArrayData data[1];
     char stringdata[16];
 };
@@ -151,5 +151,5 @@ int GoPaintedValue::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
     if (_id < 0)
         return _id;
     return _id;
-}
+}*/
 QT_END_MOC_NAMESPACE

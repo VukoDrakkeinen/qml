@@ -1,7 +1,7 @@
 package qml
 
 // #cgo CPPFLAGS: -I./cpp
-// #cgo CXXFLAGS: -std=c++0x -pedantic-errors -Wall -fno-strict-aliasing
+// #cgo CXXFLAGS: -std=c++14 -pedantic-errors -Wall -fno-strict-aliasing -pipe -ggdb
 // #cgo LDFLAGS: -lstdc++
 // #cgo pkg-config: Qt5Core Qt5Widgets Qt5Quick
 //
@@ -19,18 +19,18 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"gopkg.in/qml.v1/cdata"
+	"github.com/VukoDrakkeinen/qml/cdata"
 )
 
 var (
-	guiFunc      = make(chan func())
-	guiDone      = make(chan struct{})
-	guiLock      = 0
-	guiMainRef   uintptr
-	guiPaintRef  uintptr
-	guiIdleRun   int32
+	guiFunc     = make(chan func())
+	guiDone     = make(chan struct{})
+	guiLock     = 0
+	guiMainRef  uintptr
+	guiPaintRef uintptr
+	guiIdleRun  int32
 
-	initialized int32
+	waitForInit = make(chan struct{})
 )
 
 func init() {
@@ -49,14 +49,19 @@ func Run(f func() error) error {
 	if cdata.Ref() != guiMainRef {
 		panic("Run must be called on the initial goroutine so apps are portable to Mac OS")
 	}
-	if !atomic.CompareAndSwapInt32(&initialized, 0, 1) {
+
+	select {
+	case <-waitForInit: //channel's already closed
 		panic("qml.Run called more than once")
+	default:
 	}
 	C.newGuiApplication()
 	C.idleTimerInit((*C.int32_t)(&guiIdleRun))
+	close(waitForInit)
+
 	done := make(chan error, 1)
 	go func() {
-		RunMain(func() {}) // Block until the event loop is running.
+		RunInMain(func() {}) // Block until the event loop is running.
 		done <- f()
 		C.applicationExit()
 	}()
@@ -68,13 +73,15 @@ func Run(f func() error) error {
 //
 // This is meant to be used by extensions that integrate directly with the
 // underlying QML logic.
-func RunMain(f func()) {
+func RunInMain(f func()) {
 	ref := cdata.Ref()
 	if ref == guiMainRef || ref == atomic.LoadUintptr(&guiPaintRef) {
 		// Already within the GUI or render threads. Attempting to wait would deadlock.
 		f()
 		return
 	}
+
+	<-waitForInit
 
 	// Tell Qt we're waiting for the idle hook to be called.
 	if atomic.AddInt32(&guiIdleRun, 1) == 1 {
@@ -102,14 +109,14 @@ func RunMain(f func()) {
 // Unlock is called a matching number of times.
 func Lock() {
 	// TODO Better testing for this.
-	RunMain(func() {
+	RunInMain(func() {
 		guiLock++
 	})
 }
 
 // Unlock releases the QML event loop. See Lock for details.
 func Unlock() {
-	RunMain(func() {
+	RunInMain(func() {
 		if guiLock == 0 {
 			panic("qml.Unlock called without lock being held")
 		}
@@ -120,7 +127,7 @@ func Unlock() {
 // Flush synchronously flushes all pending QML activities.
 func Flush() {
 	// TODO Better testing for this.
-	RunMain(func() {
+	RunInMain(func() {
 		C.applicationFlushAll()
 	})
 }
@@ -149,7 +156,7 @@ func Changed(value, fieldAddr interface{}) {
 		panic("provided field is not a member of the given value")
 	}
 
-	RunMain(func() {
+	RunInMain(func() {
 		tinfo := typeInfo(value)
 		for _, engine := range engines {
 			fold := engine.values[value]
@@ -217,7 +224,7 @@ const (
 func wrapGoValue(engine *Engine, gvalue interface{}, owner valueOwner) (cvalue unsafe.Pointer) {
 	gvaluev := reflect.ValueOf(gvalue)
 	gvaluek := gvaluev.Kind()
-	if gvaluek == reflect.Struct && !hashable(gvalue) {
+	if gvaluek == reflect.Struct && !hashable(gvaluev) {
 		name := gvaluev.Type().Name()
 		if name != "" {
 			name = " (" + name + ")"
@@ -284,7 +291,7 @@ func addrOf(gvalue interface{}) uintptr {
 //
 // For these reasons, typeNew holds the fold for these values until
 // their engine is known, and once it's known they may have to be
-// added to the linked list, since mulitple references for the same
+// added to the linked list, since multiple references for the same
 // gvalue may occur.
 var typeNew = make(map[*valueFold]bool)
 
@@ -361,30 +368,29 @@ func deref(value reflect.Value) reflect.Value {
 
 //export hookGoValueReadField
 func hookGoValueReadField(enginep, foldp unsafe.Pointer, reflectIndex, getIndex, setIndex C.int, resultdv *C.DataValue) {
+	//fmt.Printf("hookRead idx: %v get: %v set %v\n", reflectIndex, getIndex, setIndex)
 	fold := ensureEngine(enginep, foldp)
 
 	var field reflect.Value
 	if getIndex >= 0 {
 		field = reflect.ValueOf(fold.gvalue).Method(int(getIndex)).Call(nil)[0]
 	} else {
-		field = deref(reflect.ValueOf(fold.gvalue)).Field(int(reflectIndex))
+		field = deref(reflect.ValueOf(fold.gvalue)).FieldByIndex(reflectIndices[int(reflectIndex)])
 	}
 	field = deref(field)
 
 	// Cannot compare Type directly as field may be invalid (nil).
-	if field.Kind() == reflect.Slice && field.Type() == typeObjSlice {
-		// TODO Handle getters that return []qml.Object.
-		// TODO Handle other GoValue slices (!= []qml.Object).
+	fieldk := field.Kind()
+	if fieldk == reflect.Slice && field.Type() == typeObjSlice { //todo: move to packDataValue
 		resultdv.dataType = C.DTListProperty
 		*(*unsafe.Pointer)(unsafe.Pointer(&resultdv.data)) = C.newListProperty(foldp, C.intptr_t(reflectIndex), C.intptr_t(setIndex))
 		return
 	}
 
-	fieldk := field.Kind()
-	if fieldk == reflect.Slice || fieldk == reflect.Struct && field.Type() != typeRGBA {
+	if fieldk == reflect.Slice || fieldk == reflect.Struct && field.Type() != typeRGBA && field.Type() != typeTime {
 		if field.CanAddr() {
 			field = field.Addr()
-		} else if !hashable(field.Interface()) {
+		} else if !hashable(field) {
 			t := reflect.ValueOf(fold.gvalue).Type()
 			for t.Kind() == reflect.Ptr {
 				t = t.Elem()
@@ -402,7 +408,7 @@ func hookGoValueReadField(enginep, foldp unsafe.Pointer, reflectIndex, getIndex,
 	// before C++ has a chance to look at the data. We can solve this problem
 	// by queuing up values in a stack, and cleaning the stack when the
 	// idle timer fires next.
-	packDataValue(gvalue, resultdv, fold.engine, jsOwner)
+	*resultdv = packDataValue(gvalue, fold.engine, jsOwner)
 }
 
 //export hookGoValueWriteField
@@ -416,14 +422,14 @@ func hookGoValueWriteField(enginep, foldp unsafe.Pointer, reflectIndex, setIndex
 	var field, setMethod reflect.Value
 	if reflectIndex >= 0 {
 		// It's a real field rather than a getter.
-		field = ve.Field(int(reflectIndex))
+		field = ve.FieldByIndex(reflectIndices[int(reflectIndex)])
 	}
 	if setIndex >= 0 {
 		// It has a setter.
 		setMethod = v.Method(int(setIndex))
 	}
 
-	assign := unpackDataValue(assigndv, fold.engine)
+	assign := unpackDataValue(*assigndv, fold.engine)
 
 	// TODO Return false to the call site if it fails. That's how Qt seems to handle it internally.
 	err := convertAndSet(field, reflect.ValueOf(assign), setMethod)
@@ -439,36 +445,60 @@ func convertAndSet(to, from reflect.Value, setMethod reflect.Value) (err error) 
 	} else {
 		toType = to.Type()
 	}
+
 	fromType := from.Type()
-	defer func() {
-		// TODO This is catching more than it should. There are calls
-		//      to custom code below that should be isolated.
-		if v := recover(); v != nil {
-			err = fmt.Errorf("cannot use %s as a %s", fromType, toType)
-		}
-	}()
-	if fromType == typeList && toType.Kind() == reflect.Slice {
+	toKind := toType.Kind()
+	if fromType == typeList && toKind == reflect.Slice {
 		list := from.Interface().(*List)
 		from = reflect.MakeSlice(toType, len(list.data), len(list.data))
-		elemType := toType.Elem()
 		for i, elem := range list.data {
-			from.Index(i).Set(reflect.ValueOf(elem).Convert(elemType))
+			err = convertAndSet(from.Index(i), reflect.ValueOf(elem), reflect.Value{})
+			if err != nil {
+				return fmt.Errorf("Cannot use QML list as %v (incompatible element types: %v)", toType, err.Error())
+			}
 		}
-	} else if fromType == typeMap && toType.Kind() == reflect.Map {
+	} else if fromType == typeMap && toKind == reflect.Map {
 		qmap := from.Interface().(*Map)
 		from = reflect.MakeMap(toType)
 		elemType := toType.Elem()
+		keyType := toType.Key()
 		for i := 0; i < len(qmap.data); i += 2 {
 			key := reflect.ValueOf(qmap.data[i])
-			val := reflect.ValueOf(qmap.data[i+1])
-			if val.Type() != elemType {
-				val = val.Convert(elemType)
+			qval := reflect.ValueOf(qmap.data[i+1])
+			if qkeyType := key.Type(); qkeyType != keyType {
+				if qkeyType.ConvertibleTo(keyType) {
+					key = key.Convert(keyType)
+				} else {
+					return fmt.Errorf("Cannot use QML map/object as %v (incompatible key types: cannot convert %v to %v)", toType, qkeyType, keyType)
+				}
+			}
+			val := reflect.New(elemType).Elem()
+			err = convertAndSet(val, qval, reflect.Value{})
+			if err != nil {
+				return fmt.Errorf("Cannot use QML map/object as %v (incompatible value types: %v)", toType, err.Error())
 			}
 			from.SetMapIndex(key, val)
 		}
+	} else if fromType == typeMap && toKind == reflect.Ptr && toType.Elem().Kind() == reflect.Struct { //todo: necessary?
+		fmt.Println("automatic unmarshal on ptr", fromType, "->", toType)
+		from.Interface().(*Map).unmarshal(to)
+	} else if fromType == typeMap && toKind == reflect.Struct {
+		if to.CanAddr() {
+			from.Interface().(*Map).unmarshal(to.Addr())
+			return nil
+		} else {
+			return fmt.Errorf("Cannot unmarshal map to %v (struct is not addressable)", toType)
+		}
 	} else if toType != fromType {
-		from = from.Convert(toType)
+		if reflect.PtrTo(toType).Implements(reflect.TypeOf((*Unmarshaller)(nil)).Elem()) {
+			return to.Addr().Interface().(Unmarshaller).UnmarshalQML(from.Interface())
+		} else if fromType.ConvertibleTo(toType) {
+			from = from.Convert(toType)
+		} else {
+			return fmt.Errorf("unable to convert %s to %s", fromType, toType)
+		}
 	}
+
 	if setMethod.IsValid() {
 		setMethod.Call([]reflect.Value{from})
 	} else {
@@ -491,6 +521,17 @@ func hookGoValueCallMethod(enginep, foldp unsafe.Pointer, reflectIndex C.int, ar
 	//      gvalue here for that. This should happen in a sensible place in the wrapping functions
 	//      that can still error out to the user in due time.
 
+	if reflectIndex < 0 {
+		var result interface{}
+		if reflectIndex <= ToStringStringer {
+			result = callJavascriptToString(v, reflectIndex)
+		} else {
+			result = callJavascriptValueOf(v, reflectIndex)
+		}
+		*args = packDataValue(result, fold.engine, jsOwner)
+		return
+	}
+
 	method := v.Method(int(reflectIndex))
 	methodt := method.Type()
 	methodName := v.Type().Method(int(reflectIndex)).Name
@@ -501,7 +542,7 @@ func hookGoValueCallMethod(enginep, foldp unsafe.Pointer, reflectIndex C.int, ar
 
 	numIn := methodt.NumIn()
 	for i := 0; i < numIn; i++ {
-		paramdv := (*C.DataValue)(unsafe.Pointer(uintptr(unsafe.Pointer(args)) + (uintptr(i)+1)*dataValueSize))
+		paramdv := *(*C.DataValue)(unsafe.Pointer(uintptr(unsafe.Pointer(args)) + (uintptr(i)+1)*dataValueSize))
 		param := reflect.ValueOf(unpackDataValue(paramdv, fold.engine))
 		if argt := methodt.In(i); param.Type() != argt {
 			param, err = convertParam(methodName, i, param, argt)
@@ -515,16 +556,12 @@ func hookGoValueCallMethod(enginep, foldp unsafe.Pointer, reflectIndex C.int, ar
 	result := method.Call(params[:numIn])
 
 	if len(result) == 1 {
-		packDataValue(result[0].Interface(), args, fold.engine, jsOwner)
+		*args = packDataValue(result[0].Interface(), fold.engine, jsOwner)
 	} else if len(result) > 1 {
-		if len(result) > len(dataValueArray) {
+		if len(result) > len(dataValueArray) { //todo: remove
 			panic("function has too many results")
 		}
-		for i, v := range result {
-			packDataValue(v.Interface(), &dataValueArray[i], fold.engine, jsOwner)
-		}
-		args.dataType = C.DTVariantList
-		*(*unsafe.Pointer)(unsafe.Pointer(&args.data)) = C.newVariantList(&dataValueArray[0], C.int(len(result)))
+		*args = packDataValue(result, fold.engine, jsOwner)
 	}
 }
 
@@ -605,23 +642,23 @@ func ensureEngine(enginep, foldp unsafe.Pointer) *valueFold {
 }
 
 func initGoType(fold *valueFold) {
-	if cdata.Ref() == atomic.LoadUintptr(&guiPaintRef) {
-		go RunMain(func() { _initGoType(fold, true) })
-	} else {
-		_initGoType(fold, false)
+	init := func(fold *valueFold, schedulePaint bool) {
+		if !fold.init.IsValid() {
+			return
+		}
+		// TODO Would be good to preserve identity on the Go side. See unpackDataValue as well.
+		obj := &Common{engine: fold.engine, addr: fold.cvalue}
+		fold.init.Call([]reflect.Value{reflect.ValueOf(fold.gvalue), reflect.ValueOf(obj)})
+		fold.init = reflect.Value{}
+		if schedulePaint {
+			obj.Call("update")
+		}
 	}
-}
 
-func _initGoType(fold *valueFold, schedulePaint bool) {
-	if !fold.init.IsValid() {
-		return
-	}
-	// TODO Would be good to preserve identity on the Go side. See unpackDataValue as well.
-	obj := &Common{engine: fold.engine, addr: fold.cvalue}
-	fold.init.Call([]reflect.Value{reflect.ValueOf(fold.gvalue), reflect.ValueOf(obj)})
-	fold.init = reflect.Value{}
-	if schedulePaint {
-		obj.Call("update")
+	if cdata.Ref() == atomic.LoadUintptr(&guiPaintRef) {
+		go RunInMain(func() { init(fold, true) })
+	} else {
+		init(fold, false)
 	}
 }
 
@@ -632,7 +669,7 @@ func hookPanic(message *C.char) {
 }
 
 func listSlice(fold *valueFold, reflectIndex C.intptr_t) *[]Object {
-	field := deref(reflect.ValueOf(fold.gvalue)).Field(int(reflectIndex))
+	field := deref(reflect.ValueOf(fold.gvalue)).FieldByIndex(reflectIndices[int(reflectIndex)])
 	return field.Addr().Interface().(*[]Object)
 }
 
@@ -657,7 +694,7 @@ func hookListPropertyAppend(foldp unsafe.Pointer, reflectIndex, setIndex C.intpt
 	var objdv C.DataValue
 	objdv.dataType = C.DTObject
 	*(*unsafe.Pointer)(unsafe.Pointer(&objdv.data)) = objp
-	newslice := append(*slice, unpackDataValue(&objdv, fold.engine).(Object))
+	newslice := append(*slice, unpackDataValue(objdv, fold.engine).(Object))
 	if setIndex >= 0 {
 		reflect.ValueOf(fold.gvalue).Method(int(setIndex)).Call([]reflect.Value{reflect.ValueOf(newslice)})
 	} else {

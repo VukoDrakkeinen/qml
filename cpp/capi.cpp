@@ -12,6 +12,10 @@
 #include "connector.h"
 #include "capi.h"
 
+QJSValue unpackDataValueJS(DataValue value, QQmlEngine* engine);
+QVariant unpackDataValue2(DataValue value, QQmlEngine* engine);
+DataValue packDataValue2(QVariant qvar);
+
 static char *local_strdup(const char *str)
 {
     char *strcopy = 0;
@@ -317,16 +321,8 @@ void contextSetProperty(QQmlContext_ *context, QString_ *name, DataValue *value)
     const QString *qname = reinterpret_cast<QString *>(name);
     QQmlContext *qcontext = reinterpret_cast<QQmlContext *>(context);
 
-    QVariant var;
-    unpackDataValue(value, &var);
-
-    // Give qvalue an engine reference if it doesn't yet have one .
-    QObject *obj = var.value<QObject *>();
-    if (obj && !qmlEngine(obj)) {
-        QQmlEngine::setContextForObject(obj, qcontext);
-    }
-
-    qcontext->setContextProperty(*qname, var);
+    QVariant qvar = unpackDataValue2(*value, qcontext->engine());
+    qcontext->setContextProperty(*qname, qvar);
 }
 
 void contextGetProperty(QQmlContext_ *context, QString_ *name, DataValue *result)
@@ -335,7 +331,7 @@ void contextGetProperty(QQmlContext_ *context, QString_ *name, DataValue *result
     const QString *qname = reinterpret_cast<QString *>(name);
 
     QVariant var = qcontext->contextProperty(*qname);
-    packDataValue(&var, result);
+    *result = packDataValue2(var);
 }
 
 QQmlContext_ *contextSpawn(QQmlContext_ *context)
@@ -362,63 +358,36 @@ const char *objectTypeName(QObject_ *object)
 int objectGetProperty(QObject_ *object, const char *name, DataValue *result)
 {
     QObject *qobject = reinterpret_cast<QObject *>(object);
-    
-    QVariant var = qobject->property(name);
-    packDataValue(&var, result);
+    QVariant var = QQmlProperty::read(qobject, name, qmlContext(qobject));
+    *result = packDataValue2(var);
 
-    if (!var.isValid() && qobject->metaObject()->indexOfProperty(name) == -1) {
-            // TODO May have to check the dynamic property names too.
-            return 0;
-    }
-    return 1;
+    return var.isValid() ? 1 : 0;
 }
 
 error *objectSetProperty(QObject_ *object, const char *name, DataValue *value)
 {
     QObject *qobject = reinterpret_cast<QObject *>(object);
-    QVariant var;
-    unpackDataValue(value, &var);
 
-    // Give qvalue an engine reference if it doesn't yet have one.
-    QObject *obj = var.value<QObject *>();
-    if (obj && !qmlEngine(obj)) {
-        QQmlContext *context = qmlContext(qobject);
-        if (context) {
-            QQmlEngine::setContextForObject(obj, context);
+    QQmlProperty property(qobject, QString(name));
+    if (!property.isValid()) {
+        return errorf("cannot set non-existent property \"%s\" on type %s", name, qobject->metaObject()->className());
+    }
+
+    QVariant qvar = unpackDataValue2(*value, qmlEngine(qobject));
+    if (!property.write(qvar)) {
+        if (!property.isWritable()) {
+            return errorf("cannot set non-writable property \"%s\" on type", name, qobject->metaObject()->className());
+        }
+        auto propertyType = property.propertyType();
+        auto qvarType = qvar.userType();
+        QObject*  unwrapped;
+        if (qvarType == qMetaTypeId<QJSValue>() && (unwrapped = qvar.value<QJSValue>().toQObject())) {
+            return errorf("cannot set property \"%s\" with type %s to value of %s*", name, QMetaType::typeName(propertyType), unwrapped->metaObject()->className());
+        } else {
+            return errorf("cannot set property \"%s\" with type %s to value of %s", name, QMetaType::typeName(propertyType), QMetaType::typeName(qvarType));
         }
     }
 
-    // Check that the types are compatible. There's probably more to be done here.
-    const QMetaObject *metaObject = qobject->metaObject();
-    int propIndex = metaObject->indexOfProperty(name);
-    if (propIndex == -1) {
-            return errorf("cannot set non-existent property \"%s\" on type %s", name, qobject->metaObject()->className());
-    }
-
-    QMetaProperty prop = metaObject->property(propIndex);
-    int propType = prop.userType();
-    void *valueArg;
-    if (propType == QMetaType::QVariant) {
-        valueArg = (void *)&var;
-    } else {
-        int varType = var.userType();
-        QVariant saved = var;
-        if (propType != varType && !var.convert(propType)) {
-            if (varType == QMetaType::QObjectStar) {
-                return errorf("cannot set property \"%s\" with type %s to value of %s*",
-                        name, QMetaType::typeName(propType), saved.value<QObject*>()->metaObject()->className());
-            } else {
-                return errorf("cannot set property \"%s\" with type %s to value of %s",
-                        name, QMetaType::typeName(propType), QMetaType::typeName(varType));
-            }
-        }
-        valueArg = (void *)var.constData();
-    }
-
-    int status = -1;
-    int flags = 0;
-    void *args[] = {valueArg, 0, &status, &flags};
-    QMetaObject::metacall(qobject, QMetaObject::WriteProperty, propIndex, args);
     return 0;
 }
 
@@ -427,15 +396,22 @@ error *objectInvoke(QObject_ *object, const char *method, int methodLen, DataVal
     QObject *qobject = reinterpret_cast<QObject *>(object);
 
     QVariant result;
-    QVariant param[MaxParams];
+    QVariant param[MaxParams];  //needed because Q_ARG takes an address, so we can't use a temporary QVariant created by unpackDataValue
     QGenericArgument arg[MaxParams];
     for (int i = 0; i < paramsLen; i++) {
-        unpackDataValue(&paramsdv[i], &param[i]);
+        param[i] = unpackDataValue2(paramsdv[i], qmlEngine(qobject));
         arg[i] = Q_ARG(QVariant, param[i]);
     }
     if (paramsLen > 10) {
         panicf("fix the parameter dispatching");
     }
+
+	//todo: test
+	bool ok = QMetaObject::invokeMethod(qobject, method, Qt::DirectConnection, Q_RETURN_ARG(QVariant, result), arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8], arg[9]);
+	if (ok) {
+		*resultdv = packDataValue2(result);
+		return 0;
+	}
 
     const QMetaObject *metaObject = qobject->metaObject();
     // Walk backwards so descendants have priority.
@@ -452,7 +428,7 @@ error *objectInvoke(QObject_ *object, const char *method, int methodLen, DataVal
 
                 bool ok;
                 if (metaMethod.returnType() == QMetaType::Void) {
-                    ok = metaMethod.invoke(qobject, Qt::DirectConnection, 
+                    ok = metaMethod.invoke(qobject, Qt::DirectConnection,
                         arg[0], arg[1], arg[2], arg[3], arg[4], arg[5], arg[6], arg[7], arg[8], arg[9]);
                 } else {
                     ok = metaMethod.invoke(qobject, Qt::DirectConnection, Q_RETURN_ARG(QVariant, result),
@@ -462,7 +438,7 @@ error *objectInvoke(QObject_ *object, const char *method, int methodLen, DataVal
                     return errorf("invalid parameters to method \"%s\"", method);
                 }
 
-                packDataValue(&result, resultdv);
+                *resultdv = packDataValue2(result);
                 return 0;
             }
         }
@@ -481,7 +457,7 @@ void objectFindChild(QObject_ *object, QString_ *name, DataValue *resultdv)
     if (result) {
         var.setValue(result);
     }
-    packDataValue(&var, resultdv);
+    *resultdv = packDataValue2(var);
 }
 
 void objectSetParent(QObject_ *object, QObject_ *parent)
@@ -528,30 +504,30 @@ QQmlContext_ *objectContext(QObject_ *object)
 int objectIsComponent(QObject_ *object)
 {
     QObject *qobject = static_cast<QObject *>(object);
-    return dynamic_cast<QQmlComponent *>(qobject) ? 1 : 0;
+    return qobject_cast<QQmlComponent*>(qobject) ? 1 : 0;
 }
 
 int objectIsWindow(QObject_ *object)
 {
     QObject *qobject = static_cast<QObject *>(object);
-    return dynamic_cast<QQuickWindow *>(qobject) ? 1 : 0;
+    return qobject_cast<QQuickWindow*>(qobject) ? 1 : 0;
 }
 
 int objectIsView(QObject_ *object)
 {
     QObject *qobject = static_cast<QObject *>(object);
-    return dynamic_cast<QQuickView *>(qobject) ? 1 : 0;
+    return qobject_cast<QQuickView*>(qobject) ? 1 : 0;
 }
 
 error *objectGoAddr(QObject_ *object, GoAddr **addr)
 {
     QObject *qobject = static_cast<QObject *>(object);
-    GoValue *goValue = dynamic_cast<GoValue *>(qobject);
+    GoValueWrapper *goValue = qobject_cast<GoValueWrapper*>(qobject);
     if (goValue) {
         *addr = goValue->addr;
         return 0;
     }
-    GoPaintedValue *goPaintedValue = dynamic_cast<GoPaintedValue *>(qobject);
+    GoPaintedValueWrapper* goPaintedValue = qobject_cast<GoPaintedValueWrapper*>(qobject);
     if (goPaintedValue) {
         *addr = goPaintedValue->addr;
         return 0;
@@ -575,20 +551,20 @@ GoValue_ *newGoValue(GoAddr *addr, GoTypeInfo *typeInfo, QObject_ *parent)
 {
     QObject *qparent = reinterpret_cast<QObject *>(parent);
     if (typeInfo->paint) {
-        return new GoPaintedValue(addr, typeInfo, qparent);
+        return new GoPaintedValueWrapper(addr, typeInfo, qparent);
     }
-    return new GoValue(addr, typeInfo, qparent);
+    return new GoValueWrapper(addr, typeInfo, qparent);
 }
 
 void goValueActivate(GoValue_ *value, GoTypeInfo *typeInfo, int addrOffset)
 {
     GoMemberInfo *fieldInfo = typeInfo->fields;
-    for (int i = 0; i < typeInfo->fieldsLen; i++) {
+    for (int i = 0; i < typeInfo->fieldsLen; i++) { //todo: don't fucking iterate, look it up in an array
         if (fieldInfo->addrOffset == addrOffset) {
             if (typeInfo->paint) {
-                static_cast<GoPaintedValue *>(value)->activate(fieldInfo->metaIndex);
+                static_cast<GoPaintedValueWrapper*>(value)->propertyChanged(i);
             } else {
-                static_cast<GoValue *>(value)->activate(fieldInfo->metaIndex);
+                static_cast<GoValueWrapper*>(value)->propertyChanged(i);
             }
             return;
         }
@@ -598,217 +574,276 @@ void goValueActivate(GoValue_ *value, GoTypeInfo *typeInfo, int addrOffset)
     // TODO Return an error; probably an unexported field.
 }
 
-void unpackDataValue(DataValue *value, QVariant_ *var)
-{
-    QVariant *qvar = reinterpret_cast<QVariant *>(var);
-    switch (value->dataType) {
+/*{
+    QQmlListReference ref = qvar->value<QQmlListReference>();
+    if (ref.isValid() && ref.canCount() && ref.canAt()) {
+        int len = ref.count();
+        DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
+        QVariant elem;
+        for (int i = 0; i < len; i++) {
+            elem.setValue(ref.at(i));
+            packDataValue(&elem, &dvlist[i]);
+        }
+        value->dataType = DTValueList;
+        value->len = len;
+        *(DataValue**)(value->data) = dvlist;
+        break;
+    }
+}
+if (qstrncmp(qvar->typeName(), "QQmlListProperty<", 17) == 0) {
+    QQmlListProperty<QObject> *list = reinterpret_cast<QQmlListProperty<QObject>*>(qvar->data());
+    if (list->count && list->at) {
+        int len = list->count(list);
+        DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
+        QVariant elem;
+        for (int i = 0; i < len; i++) {
+            elem.setValue(list->at(list, i));
+            packDataValue(&elem, &dvlist[i]);
+        }
+        value->dataType = DTValueList;
+        value->len = len;
+        *(DataValue**)(value->data) = dvlist;
+        break;
+    }
+}*/
+
+QVariant unpackDataValue2(DataValue value, QQmlEngine* engine) {
+//	qDebug() << "DT" << value.dataType;
+    switch (value.dataType) {
     case DTString:
-        *qvar = QString::fromUtf8(*(char **)value->data, value->len);
-        break;
+        return QVariant(QString::fromUtf8(*reinterpret_cast<char**>(value.data), value.len));   //todo: try returning {bool/int/...}
     case DTBool:
-        *qvar = bool(*(char *)(value->data) != 0);
-        break;
-    case DTInt64:
-        *qvar = *(qint64*)(value->data);
-        break;
-    case DTInt32:
-        *qvar = *(qint32*)(value->data);
-        break;
-    case DTUint64:
-        *qvar = *(quint64*)(value->data);
-        break;
-    case DTUint32:
-        *qvar = *(quint32*)(value->data);
-        break;
-    case DTFloat64:
-        *qvar = *(double*)(value->data);
-        break;
-    case DTFloat32:
-        *qvar = *(float*)(value->data);
-        break;
+        return QVariant(*reinterpret_cast<bool*>(value.data));
+    case DTNumber:
+        return QVariant(*reinterpret_cast<double*>(value.data));
+    case DTNumberI:
+        return QVariant(*reinterpret_cast<int*>(value.data));
+    case DTNumberU:
+        return QVariant(*reinterpret_cast<uint*>(value.data));
+    case DTUintptr:
+        return QVariant::fromValue(*reinterpret_cast<void**>(value.data));
     case DTColor:
-        *qvar = QColor::fromRgba(*(QRgb*)(value->data));
-        break;
-    case DTVariantList:
-        *qvar = **(QVariantList**)(value->data);
-        delete *(QVariantList**)(value->data);
-        break;
+        return QVariant::fromValue(QColor::fromRgba(*reinterpret_cast<QRgb*>(value.data)));
+    case DTTime:
+        return QVariant::fromValue(QDateTime::fromMSecsSinceEpoch(*reinterpret_cast<qint64*>(value.data), Qt::UTC));
+    case DTList:    qDebug() << "list";
+    case DTMap:     qDebug() << "map";
+    case DTObject:  qDebug() << "obj";
+    case DTInvalid: qDebug() << "invalid";
+        qDebug() << "Unpacking list/map/object/invalid";
+        return QVariant::fromValue(unpackDataValueJS(value, engine));
+    case DTListProperty:    //todo:
+        panicf("DTListProperty handling unimplemented");
+        return QVariant();
+    default:
+        panicf("unknown data type: %v", value.dataType);
+	    return QVariant();
+    }
+    //return QVariant::fromValue(QJSValue(QJSValue::UndefinedValue));
+}
+
+QJSValue unpackDataValueJS(DataValue value, QQmlEngine* engine) {
+    switch (value.dataType) {
+    case DTString:
+        return QJSValue(QString::fromUtf8(*reinterpret_cast<char**>(value.data), value.len));
+    case DTBool:
+        return QJSValue(*reinterpret_cast<bool*>(value.data));
+    case DTNumber:
+        return QJSValue(*reinterpret_cast<double*>(value.data));
+    case DTNumberI:
+        return QJSValue(*reinterpret_cast<int*>(value.data));
+    case DTNumberU:
+        return QJSValue(*reinterpret_cast<uint*>(value.data));
+    case DTColor:
+        return engine->toScriptValue(QColor::fromRgba(*reinterpret_cast<QRgb*>(value.data)));
+    case DTTime:
+        return engine->toScriptValue(QDateTime::fromMSecsSinceEpoch(*reinterpret_cast<qint64*>(value.data), Qt::UTC));
+    case DTList: {
+	        QJSValue array = engine->newArray(value.len);
+	        for (int i = 0; i < value.len; i++) {
+	            array.setProperty(i, unpackDataValueJS((*reinterpret_cast<DataValue**>(value.data))[i], engine));
+	        }
+	        free(*reinterpret_cast<void**>(value.data));
+	        return array;
+        }
+    case DTMap: {
+	        QJSValue object = engine->newObject();
+	        for (int i = 0; i < value.len; i+=2) {
+	            DataValue key = (*reinterpret_cast<DataValue**>(value.data))[i+0];
+	            DataValue val = (*reinterpret_cast<DataValue**>(value.data))[i+1];
+	            object.setProperty(QString::fromUtf8(*reinterpret_cast<char**>(key.data), key.len), unpackDataValueJS(val, engine));
+	        }
+	        free(*reinterpret_cast<void**>(value.data));
+	        return object;
+        }
     case DTObject:
-        qvar->setValue(*(QObject**)(value->data));
-        break;
+        return engine->newQObject(*reinterpret_cast<QObject**>(value.data));
     case DTInvalid:
-        // null would be more natural, but an invalid variant means
-        // it has proper semantics when dealing with non-qml qt code.
-        //qvar->setValue(QJSValue(QJSValue::NullValue));
-        qvar->clear();
-        break;
+        return QJSValue(QJSValue::NullValue);
     default:
-        panicf("unknown data type: %d", value->dataType);
+        panicf("unknown data type: %v", value.dataType);
         break;
     }
+
+    return QJSValue(QJSValue::UndefinedValue);
 }
 
-void packDataValue(QVariant_ *var, DataValue *value)
-{
-    QVariant *qvar = reinterpret_cast<QVariant *>(var);
+DataValue packDataValue2(QVariant qvar) {
+	DataValue ret{DTUnknown};
 
-    // Some assumptions are made below regarding the size of types.
-    // There's apparently no better way to handle this since that's
-    // how the types with well defined sizes (qint64) are mapped to
-    // meta-types (QMetaType::LongLong).
-    switch ((int)qvar->type()) {
-    case QVariant::Invalid:
-        value->dataType = DTInvalid;
-        break;
-    case QMetaType::QUrl:
-        *qvar = qvar->value<QUrl>().toString();
-        // fallthrough
-    case QMetaType::QString:
-        {
-            value->dataType = DTString;
-            QByteArray ba = qvar->toByteArray();
-            *(char**)(value->data) = local_strdup(ba.constData());
-            value->len = ba.size();
-            break;
-        }
-    case QMetaType::Bool:
-        value->dataType = DTBool;
-        *(qint8*)(value->data) = (qint8)qvar->toInt();
-        break;
-    case QMetaType::LongLong:
-        // Some of these entries will have to be fixed when handling platforms
-        // where sizeof(long long) != 8 or sizeof(int) != 4.
-        value->dataType = DTInt64;
-        *(qint64*)(value->data) = qvar->toLongLong();
-        break;
-    case QMetaType::ULongLong:
-        value->dataType = DTUint64;
-        *(quint64*)(value->data) = qvar->toLongLong();
-        break;
-    case QMetaType::Int:
-        value->dataType = DTInt32;
-        *(qint32*)(value->data) = qvar->toInt();
-        break;
-    case QMetaType::UInt:
-        value->dataType = DTUint32;
-        *(quint32*)(value->data) = qvar->toUInt();
-        break;
-    case QMetaType::VoidStar:
-        value->dataType = DTUintptr;
-        *(uintptr_t*)(value->data) = (uintptr_t)qvar->value<void *>();
-        break;
-    case QMetaType::Double:
-        value->dataType = DTFloat64;
-        *(double*)(value->data) = qvar->toDouble();
-        break;
-    case QMetaType::Float:
-        value->dataType = DTFloat32;
-        *(float*)(value->data) = qvar->toFloat();
-        break;
-    case QMetaType::QColor:
-        value->dataType = DTColor;
-        *(unsigned int*)(value->data) = qvar->value<QColor>().rgba();
-        break;
-    case QMetaType::QVariantList:
-        {
-            QVariantList varlist = qvar->toList();
-            int len = varlist.size();
-            DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
-            for (int i = 0; i < len; i++) {
-                packDataValue((void*)&varlist.at(i), &dvlist[i]);
+	auto type = qvar.userType();
+	switch (type) {
+	case QMetaType::QString: {
+			auto str = qvar.toString().toUtf8();
+	        ret.dataType = DTString;
+	        *reinterpret_cast<char**>(ret.data) = local_strdup(str.constData());    //todo: request allocation in Go-land, memcpy data there and unsafe-construct a string
+	        ret.len = str.size();
+		}
+		break;
+	case QMetaType::Bool: {
+			ret.dataType = DTBool;
+	        *reinterpret_cast<bool*>(ret.data) = qvar.toBool();
+		}
+		break;
+	case QMetaType::Double: {
+			ret.dataType = DTNumber;
+	        *reinterpret_cast<double*>(ret.data) = qvar.toDouble();
+		}
+		break;
+	case QMetaType::Int: {
+			ret.dataType = DTNumberI;
+            *reinterpret_cast<int*>(ret.data) = qvar.toInt();
+		}
+		break;
+	case QMetaType::UInt: {
+			ret.dataType = DTNumberU;
+			*reinterpret_cast<uint*>(ret.data) = qvar.toUInt();
+		}
+		break;
+	case QMetaType::QColor: {
+			ret.dataType = DTColor;
+            *reinterpret_cast<quint32*>(ret.data) = qvar.value<QColor>().rgba();
+		}
+		break;
+	case QMetaType::QDateTime: {
+			ret.dataType = DTTime;
+	        *reinterpret_cast<qint64*>(ret.data) = qvar.toDateTime().toMSecsSinceEpoch();
+		}
+		break;
+	case QMetaType::QVariantList: {
+			qDebug() << "QMetaType::QVariantList";
+		}
+		break;
+	case QMetaType::QVariantMap: {
+			qDebug() << "QMetaType::QVariantMap";
+		}
+		break;
+	case QMetaType::VoidStar: {
+			auto data = qvar.value<void*>();
+            if (data) {
+                ret.dataType = DTUintptr;
+                *reinterpret_cast<void**>(ret.data) = data;
+            } else {
+                ret.dataType = DTInvalid;
             }
-            value->dataType = DTValueList;
-            value->len = len;
-            *(DataValue**)(value->data) = dvlist;
-        }
-        break;
-    case QMetaType::QVariantMap:
-        {
-            QVariantMap varmap = qvar->toMap();
-            int len = varmap.size() * 2;
-            DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
-            QMapIterator<QString, QVariant> it(varmap);
-            for (int i = 0; i < len; i += 2) {
-                if (!it.hasNext()) {
-                    panicf("QVariantMap mutated during iteration");
-                }
-                it.next();
-                QVariant key = it.key();
-                QVariant val = it.value();
-                packDataValue((void*)&key, &dvlist[i]);
-                packDataValue((void*)&val, &dvlist[i+1]);
-            }
-            value->dataType = DTValueMap;
-            value->len = len;
-            *(DataValue**)(value->data) = dvlist;
-        }
-        break;
-    default:
-        if (qvar->type() == (int)QMetaType::QObjectStar || qvar->canConvert<QObject *>()) {
-            QObject *qobject = qvar->value<QObject *>();
-            GoValue *goValue = dynamic_cast<GoValue *>(qobject);
-            if (goValue) {
-                value->dataType = DTGoAddr;
-                *(void **)(value->data) = goValue->addr;
-                break;
-            }
-            GoPaintedValue *goPaintedValue = dynamic_cast<GoPaintedValue *>(qobject);
-            if (goPaintedValue) {
-                value->dataType = DTGoAddr;
-                *(void **)(value->data) = goPaintedValue->addr;
-                break;
-            }
-            value->dataType = DTObject;
-            *(void **)(value->data) = qobject;
-            break;
-        }
-        {
-            QQmlListReference ref = qvar->value<QQmlListReference>();
-            if (ref.isValid() && ref.canCount() && ref.canAt()) {
-                int len = ref.count();
-                DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
-                QVariant elem;
-                for (int i = 0; i < len; i++) {
-                    elem.setValue(ref.at(i));
-                    packDataValue(&elem, &dvlist[i]);
-                }
-                value->dataType = DTValueList;
-                value->len = len;
-                *(DataValue**)(value->data) = dvlist;
-                break;
-            }
-        }
-        if (qstrncmp(qvar->typeName(), "QQmlListProperty<", 17) == 0) {
-            QQmlListProperty<QObject> *list = reinterpret_cast<QQmlListProperty<QObject>*>(qvar->data());
-            if (list->count && list->at) {
-                int len = list->count(list);
-                DataValue *dvlist = (DataValue *) malloc(sizeof(DataValue) * len);
-                QVariant elem;
-                for (int i = 0; i < len; i++) {
-                    elem.setValue(list->at(list, i));
-                    packDataValue(&elem, &dvlist[i]);
-                }
-                value->dataType = DTValueList;
-                value->len = len;
-                *(DataValue**)(value->data) = dvlist;
-                break;
-            }
-        }
-        panicf("unsupported variant type: %d (%s)", qvar->type(), qvar->typeName());
-        break;
-    }
-}
+		}
+		break;
+	case QMetaType::UnknownType: {
+			ret.dataType = DTInvalid;
+	    }
+	    break;
+	case QMetaType::QObjectStar: {
+			qDebug() << "QMetaType::QObjectStar";
 
-QVariantList_ *newVariantList(DataValue *list, int len)
-{
-    QVariantList *vlist = new QVariantList();
-    vlist->reserve(len);
-    for (int i = 0; i < len; i++) {
-        QVariant var;
-        unpackDataValue(&list[i], &var);
-        vlist->append(var);
-    }
-    return vlist;
+			if (auto govalue = qvar.value<GoValueWrapper*>()) {
+	            qDebug() << "GoPacking GoValue*";
+	            ret.dataType = DTGoAddr;
+	            *reinterpret_cast<void**>(ret.data) = govalue->addr;
+	            break;
+	        }
+
+	        if (auto govalue = qvar.value<GoPaintedValueWrapper*>()) {
+	            qDebug() << "GoPacking GoPaintedValueWrapper*";
+	            ret.dataType = DTGoAddr;
+	            *reinterpret_cast<void**>(ret.data) = govalue->addr;
+	            break;
+	        }
+			ret.dataType = DTObject;
+	        *reinterpret_cast<void**>(ret.data) = qvar.value<QObject*>();
+	        break;
+        }
+    default: {
+		    if (type == qMetaTypeId<QJSValue>()) {
+		        auto val = qvar.value<QJSValue>();
+		        if (val.isArray()) {
+		            int len = val.property("length").toInt();
+		            DataValue* dvlist = reinterpret_cast<DataValue*>(malloc(sizeof(DataValue) * len));
+	                for (int i = 0; i < len; i++) {
+	                    dvlist[i] = packDataValue2(QVariant::fromValue(val.property(i)));
+	                }
+		            ret.dataType = DTList;
+		            *reinterpret_cast<DataValue**>(ret.data) = dvlist;
+		            ret.len = len;
+		            break;
+		        }
+
+                if (val.isQObject()) {
+					ret = packDataValue2(QVariant::fromValue(val.toQObject()));
+                    break;
+                }
+
+		        if (val.isObject()) {
+		            int cap = 16;
+		            DataValue* dvlist = reinterpret_cast<DataValue*>(malloc(sizeof(DataValue) * cap));
+		            QJSValueIterator it(val);
+		            int i = 0;
+	                while (it.next()) {
+	                    if (i >= cap) {
+	                        cap = (cap*3+1)/2;
+	                        dvlist = reinterpret_cast<DataValue*>(realloc(dvlist, sizeof(DataValue) * cap));
+	                    }
+	                    dvlist[i+0] = packDataValue2(QVariant::fromValue(it.name()));
+	                    dvlist[i+1] = packDataValue2(QVariant::fromValue(it.value()));
+	                    i += 2;
+                    }
+		            ret.dataType = DTMap;
+		            *reinterpret_cast<DataValue**>(ret.data) = dvlist;
+		            ret.len = i;
+		            break;
+		        }
+
+		        ret = packDataValue2(val.toVariant());
+		        break;
+		    }
+
+		    if (qvar.canConvert<QQmlListReference>()) { //if (type == qMetaTypeId<QQmlListReference>()) {
+		        qDebug() << "GoPacking QQmlListRef";
+		        auto ref = qvar.value<QQmlListReference>();
+		        if (ref.isValid() && ref.canCount() && ref.canAt()) {
+		            int len = ref.count();
+		            DataValue* dvlist = reinterpret_cast<DataValue*>(malloc(sizeof(DataValue) * len));
+		            for (int i = 0; i < len; i++) {
+		                dvlist[i] = packDataValue2(QVariant::fromValue(ref.at(i)));
+		            }
+		            ret.dataType = DTList;
+		            ret.len = len;
+		            *reinterpret_cast<DataValue**>(ret.data) = dvlist;
+		            break;
+		        }
+		    }
+
+		    if (qvar.canConvert<QObject*>()) {
+		        qvar.convert(QMetaType::QObjectStar);
+		        ret = packDataValue2(qvar);
+		        break;
+		    }
+		}
+	}
+
+	if (ret.dataType == DTUnknown) {
+		qDebug() << "GoPacking failed" << qvar.type() << qvar.userType() << qvar.typeName();
+	}
+    return ret;    //undefined
 }
 
 QObject *listPropertyAt(QQmlListProperty<QObject> *list, int i)
@@ -834,6 +869,7 @@ void listPropertyClear(QQmlListProperty<QObject> *list)
 QQmlListProperty_ *newListProperty(GoAddr *addr, intptr_t reflectIndex, intptr_t setIndex)
 {
     QQmlListProperty<QObject> *list = new QQmlListProperty<QObject>();
+    list->object = (QObject*)1; //workaround: avoid an assert in Qt code (QQmlObjectCreator::setPropertyBinding: Q_ASSERT(_currentList.object))
     list->data = addr;
     list->dummy1 = (void*)reflectIndex;
     list->dummy2 = (void*)setIndex;

@@ -96,7 +96,7 @@ func init() {
 
 //export hookLogHandler
 func hookLogHandler(cmsg *C.LogMessage) {
-	// Workarund for QTBUG-35943
+	// Workaround for QTBUG-35943
 	text := unsafeString(cmsg.text, cmsg.textLen)
 	if strings.HasPrefix(text, `"Qt Warning: Compose file:`) {
 		return
