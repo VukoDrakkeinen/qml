@@ -173,10 +173,10 @@ void GoValueWrapper::propertyChanged(int propertyIndex) {
     this->meta->signalChange(propertyIndex);
 }
 
-struct qt_meta_stringdata_GoValueWrapper_t { QByteArrayData data[1]; char stringdata[16]; };    //todo: remove the macro
-#define QT_MOC_LITERAL(idx, ofs, len) Q_STATIC_BYTE_ARRAY_DATA_HEADER_INITIALIZER_WITH_OFFSET(len, offsetof(qt_meta_stringdata_GoValueWrapper_t, stringdata) + ofs - idx * sizeof(QByteArrayData))
-static const qt_meta_stringdata_GoValueWrapper_t qt_meta_stringdata_GoValueWrapper = {{QT_MOC_LITERAL(0, 0, 14)}, "GoValueWrapper\0"};
-#undef QT_MOC_LITERAL
+struct qt_meta_stringdata_GoValueWrapper_t { QByteArrayData data[1]; char stringdata[16]; };
+static const qt_meta_stringdata_GoValueWrapper_t qt_meta_stringdata_GoValueWrapper = {
+	{{{{(-1)}}, 14, 0, 0, offsetof(qt_meta_stringdata_GoValueWrapper_t, stringdata) + 0 - 0 * sizeof(QByteArrayData)}}, "GoValueWrapper\0"  //QByteArray data header
+};
 static const uint qt_meta_data_GoValueWrapper[] = {7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};   //revision, methods, properties, etc.
 const QMetaObject GoValueWrapper::staticMetaObject = {
     {&QObject::staticMetaObject, qt_meta_stringdata_GoValueWrapper.data, qt_meta_data_GoValueWrapper, qt_static_metacall, 0, 0}  //parent, name, members, static metacall function, related, extra
